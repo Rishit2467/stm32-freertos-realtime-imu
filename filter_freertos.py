@@ -10,7 +10,6 @@ lib_dir = os.path.join(
 
 lib_json_path = os.path.join(lib_dir, "library.json")
 
-# Write a strict library.json so PlatformIO only compiles ARM_CM3 and heap_4.c
 if os.path.isdir(lib_dir):
     config = {
         "name": "FreeRTOS-Kernel",
@@ -23,9 +22,9 @@ if os.path.isdir(lib_dir):
             "srcDir": ".",
             "srcFilter": [
                 "+<*.c>",
+                "-<portable/>",
                 "+<portable/GCC/ARM_CM3/port.c>",
-                "+<portable/MemMang/heap_4.c>",
-                "-<portable/*>"
+                "+<portable/MemMang/heap_4.c>"
             ]
         }
     }
