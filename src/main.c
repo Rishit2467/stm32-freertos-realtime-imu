@@ -7,14 +7,9 @@
 #include <stdlib.h>
 #include <math.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
-
 /* ============================================================================
  * 1. SYSTEM CONSTANTS & GPIO ENTRY/EXIT MACROS
  * ============================================================================ */
-#define DT_T1_SEC           0.01f       // Task 1 period: 10 ms
 #define DT_T2_SEC           0.05f       // Task 2 period: 50 ms
 #define LPF_ALPHA           0.80f       // Digital low-pass filter smoothing factor (0..1)
 #define CPU_CLK_HZ          64000000UL  // 64 MHz SYSCLK
@@ -68,6 +63,7 @@ typedef struct {
     uint32_t t3_wcet_us;
 } TelemetryState_t;
 
+ADC_HandleTypeDef  hadc1;
 UART_HandleTypeDef huart2;
 IWDG_HandleTypeDef hiwdg;
 
@@ -90,7 +86,7 @@ volatile uint8_t g_Task2Alive = 0;
 extern void xPortSysTickHandler(void);
 
 /* ============================================================================
- * 3. HARDWARE TIMER / DWT CYCLE COUNTER & SIGNAL PROCESSING HELPERS
+ * 3. HARDWARE TIMER / DWT CYCLE COUNTER, ADC & PID HELPERS
  * ============================================================================ */
 static void DWT_CycleCounter_Init(void) {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -120,23 +116,28 @@ static inline uint32_t Cycles_To_Us(uint32_t cycles) {
     return cycles / (CPU_CLK_HZ / 1000000UL);
 }
 
-// Simulates X/Y joystick-like inputs (square/step setpoint + slight noise)
-// Replace with ADC1 reads when wiring a physical joystick to PA0/PA1.
-static void Read_Simulated_XY_Channels(float *x_setpoint, float *y_feedback_raw) {
-    static uint32_t step_counter = 0;
-    float t = step_counter * DT_T1_SEC;
-    step_counter++;
+static uint16_t ADC1_Read_Channel(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_55CYCLES_5;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 
-    // Step setpoint between 25.0 and 75.0 every 4 seconds
-    int phase = ((int)(t / 4.0f)) % 2;
-    float base_sp = (phase == 0) ? 75.0f : 25.0f;
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 5);
+    uint16_t val = (uint16_t)HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return val;
+}
 
-    // Small deterministic ripple to exercise the digital low-pass filter
-    float ripple = 2.0f * sinf(2.0f * (float)M_PI * 3.0f * t);
-    *x_setpoint = base_sp + ripple;
+// Reads physical analog joystick: VRx -> PA0 (ADC1_IN0), VRy -> PA1 (ADC1_IN1)
+static void Read_Joystick_XY_Channels(float *x_setpoint, float *y_feedback_raw) {
+    uint16_t raw_x = ADC1_Read_Channel(ADC_CHANNEL_0); // 0..4095
+    uint16_t raw_y = ADC1_Read_Channel(ADC_CHANNEL_1); // 0..4095
 
-    // Secondary channel / disturbance signal
-    *y_feedback_raw = 0.5f * sinf(2.0f * (float)M_PI * 1.0f * t);
+    // Map 12-bit ADC to 0.0..100.0% control range
+    *x_setpoint     = ((float)raw_x / 4095.0f) * 100.0f;
+    *y_feedback_raw = ((float)raw_y / 4095.0f) * 100.0f;
 }
 
 static void PID_Init(PID_Controller_t *pid, float kp, float ki, float kd,
@@ -178,11 +179,11 @@ static float PID_Compute(PID_Controller_t *pid, float setpoint, float measuremen
  * 4. FREERTOS TASKS
  * ============================================================================ */
 
-/* TASK 1: Input Acquisition & Digital Low-Pass Filter (10 ms via TIM3 ISR, Prio 3) */
+/* TASK 1: Joystick ADC Acquisition & Digital Low-Pass Filter (10 ms via TIM3 ISR, Prio 3) */
 void vTask1_InputAndFilter(void *pvParameters) {
     (void)pvParameters;
-    float raw_x = 0.0f, raw_y = 0.0f;
-    float filt_x = 50.0f, filt_y = 0.0f;
+    float raw_x = 50.0f, raw_y = 50.0f;
+    float filt_x = 50.0f, filt_y = 50.0f;
     ControlInput_Msg_t msg;
 
     for (;;) {
@@ -192,7 +193,7 @@ void vTask1_InputAndFilter(void *pvParameters) {
         GPIO_T1_HIGH();
         uint32_t t_start = Timing_OnEntry(&g_T1_Timing);
 
-        Read_Simulated_XY_Channels(&raw_x, &raw_y);
+        Read_Joystick_XY_Channels(&raw_x, &raw_y);
 
         // First-order exponential low-pass filter
         filt_x = LPF_ALPHA * filt_x + (1.0f - LPF_ALPHA) * raw_x;
@@ -235,7 +236,7 @@ void vTask2_PIDController(void *pvParameters) {
         GPIO_T2_HIGH();
         uint32_t t_start = Timing_OnEntry(&g_T2_Timing);
 
-        // Drain queue to get the latest filtered setpoint
+        // Drain queue to get the latest filtered joystick setpoint
         while (xQueueReceive(xControlQueue, &rx_msg, 0) == pdPASS) {
             current_sp = rx_msg.setpoint;
         }
@@ -357,7 +358,7 @@ void TIM3_IRQHandler(void) {
 }
 
 /* ============================================================================
- * 6. HARDWARE INITIALIZATION (64 MHz Clock, GPIO, USART2, TIM3, IWDG)
+ * 6. HARDWARE INITIALIZATION (64 MHz Clock, GPIO, ADC1, USART2, TIM3, IWDG)
  * ============================================================================ */
 static void SystemClock_Config(void) {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -400,6 +401,34 @@ static void GPIO_Init(void) {
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
+static void ADC1_Joystick_Init(void) {
+    __HAL_RCC_ADC1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    // PA0 (ADC1_IN0 -> VRx) and PA1 (ADC1_IN1 -> VRy) as Analog inputs
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    // 64 MHz / 6 = 10.67 MHz ADC clock (within STM32F1 14 MHz max)
+    RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+    PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+    HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit);
+
+    hadc1.Instance = ADC1;
+    hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion = 1;
+    HAL_ADC_Init(&hadc1);
+
+    HAL_ADCEx_Calibration_Start(&hadc1);
 }
 
 static void USART2_Init(void) {
@@ -460,6 +489,7 @@ int main(void) {
     HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
 
     GPIO_Init();
+    ADC1_Joystick_Init();
     USART2_Init();
     DWT_CycleCounter_Init();
     IWDG_Init();
