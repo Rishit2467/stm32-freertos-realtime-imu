@@ -12,36 +12,61 @@
 #endif
 
 /* ============================================================================
- * 1. SYSTEM CONSTANTS & LOGIC ANALYSER BSRR MACROS
+ * 1. SYSTEM CONSTANTS & GPIO ENTRY/EXIT MACROS
  * ============================================================================ */
-#define DT_SEC              0.01f   // 10 ms sample period (100 Hz)
-#define COMP_ALPHA          0.98f   // Complementary filter weight
-#define MOVING_AVG_WINDOW   5       // 5-sample moving average in Task 2
-#define TILT_THRESHOLD_DEG  30.0f   // Alarm threshold
+#define DT_T1_SEC           0.01f       // Task 1 period: 10 ms
+#define DT_T2_SEC           0.05f       // Task 2 period: 50 ms
+#define LPF_ALPHA           0.80f       // Digital low-pass filter smoothing factor (0..1)
+#define CPU_CLK_HZ          64000000UL  // 64 MHz SYSCLK
 
-// Direct Register BSRR macros (~15 ns toggle time for Logic Analyser)
-#define LA_T1_HIGH()        (GPIOC->BSRR = GPIO_PIN_0)
-#define LA_T1_LOW()         (GPIOC->BSRR = (uint32_t)GPIO_PIN_0 << 16U)
-#define LA_T2_HIGH()        (GPIOC->BSRR = GPIO_PIN_1)
-#define LA_T2_LOW()         (GPIOC->BSRR = (uint32_t)GPIO_PIN_1 << 16U)
-#define LA_T3_HIGH()        (GPIOC->BSRR = GPIO_PIN_2)
-#define LA_T3_LOW()         (GPIOC->BSRR = (uint32_t)GPIO_PIN_2 << 16U)
+// Direct BSRR GPIO entry/exit toggles for task timing markers (PC0, PC1, PC2)
+#define GPIO_T1_HIGH()      (GPIOC->BSRR = GPIO_PIN_0)
+#define GPIO_T1_LOW()       (GPIOC->BSRR = (uint32_t)GPIO_PIN_0 << 16U)
+#define GPIO_T2_HIGH()      (GPIOC->BSRR = GPIO_PIN_1)
+#define GPIO_T2_LOW()       (GPIOC->BSRR = (uint32_t)GPIO_PIN_1 << 16U)
+#define GPIO_T3_HIGH()      (GPIOC->BSRR = GPIO_PIN_2)
+#define GPIO_T3_LOW()       (GPIOC->BSRR = (uint32_t)GPIO_PIN_2 << 16U)
 
 /* ============================================================================
- * 2. DATA STRUCTURES & RTOS HANDLES
+ * 2. DATA STRUCTURES, PID STATE, TIMING METRICS & RTOS HANDLES
  * ============================================================================ */
 typedef struct {
-    float pitch;
-    float roll;
-    uint32_t timestamp_ms;
-} IMU_AngleMsg_t;
+    float setpoint;
+    float feedback;
+    uint32_t tick_ms;
+} ControlInput_Msg_t;
 
 typedef struct {
-    float filtered_pitch;
-    float filtered_roll;
-    uint8_t tilt_alarm;
-    uint32_t sample_count;
-} SharedSystemState_t;
+    float kp;
+    float ki;
+    float kd;
+    float dt;
+    float integral;
+    float prev_error;
+    float out_min;
+    float out_max;
+} PID_Controller_t;
+
+typedef struct {
+    uint32_t last_entry_cyccnt;
+    uint32_t last_period_cycles;
+    uint32_t last_exec_cycles;
+    uint32_t wcet_cycles;
+    uint8_t  has_prev_entry;
+} TaskTiming_t;
+
+typedef struct {
+    float setpoint;
+    float output;
+    float error;
+    uint32_t seq;
+    uint32_t t1_period_us;
+    uint32_t t2_period_us;
+    uint32_t t3_period_us;
+    uint32_t t1_wcet_us;
+    uint32_t t2_wcet_us;
+    uint32_t t3_wcet_us;
+} TelemetryState_t;
 
 UART_HandleTypeDef huart2;
 IWDG_HandleTypeDef hiwdg;
@@ -50,159 +75,251 @@ TaskHandle_t xTask1Handle = NULL;
 TaskHandle_t xTask2Handle = NULL;
 TaskHandle_t xTask3Handle = NULL;
 
-QueueHandle_t xAngleQueue = NULL;
-SemaphoreHandle_t xStateMutex = NULL;
+QueueHandle_t     xControlQueue = NULL;
+SemaphoreHandle_t xStateMutex   = NULL;
 
-SharedSystemState_t g_SystemState = {0};
+TelemetryState_t g_TelemetryState = {0};
+
+TaskTiming_t g_T1_Timing = {0};
+TaskTiming_t g_T2_Timing = {0};
+TaskTiming_t g_T3_Timing = {0};
+
 volatile uint8_t g_Task1Alive = 0;
 volatile uint8_t g_Task2Alive = 0;
 
-/* External FreeRTOS Tick Handler called from TIM3 ISR */
 extern void xPortSysTickHandler(void);
 
 /* ============================================================================
- * 3. SYNTHETIC IMU GENERATOR (Replaced by Bare-Metal I2C1 in Phase 2)
+ * 3. HARDWARE TIMER / DWT CYCLE COUNTER & SIGNAL PROCESSING HELPERS
  * ============================================================================ */
-static void Read_Synthetic_IMU(float *ax, float *ay, float *az, float *gx, float *gy) {
-    static uint32_t tick_count = 0;
-    float t = tick_count * DT_SEC;
-    tick_count++;
+static void DWT_CycleCounter_Init(void) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
 
-    // Smooth 0.5 Hz pitch oscillation (+/- 38 deg) to trigger >30 deg threshold
-    float true_pitch_rad = (38.0f * M_PI / 180.0f) * sinf(2.0f * M_PI * 0.5f * t);
-    float true_roll_rad  = (15.0f * M_PI / 180.0f) * cosf(2.0f * M_PI * 0.25f * t);
+static inline uint32_t Timing_OnEntry(TaskTiming_t *t) {
+    uint32_t now = DWT->CYCCNT;
+    if (t->has_prev_entry) {
+        t->last_period_cycles = now - t->last_entry_cyccnt;
+    }
+    t->last_entry_cyccnt = now;
+    t->has_prev_entry = 1;
+    return now;
+}
 
-    float noise = ((int)(tick_count % 7) - 3) * 0.01f;
-    *ax = sinf(true_pitch_rad) + noise;
-    *ay = sinf(true_roll_rad)  - noise;
-    *az = cosf(true_pitch_rad) * cosf(true_roll_rad);
+static inline void Timing_OnExit(TaskTiming_t *t, uint32_t entry_cyccnt) {
+    uint32_t elapsed = DWT->CYCCNT - entry_cyccnt;
+    t->last_exec_cycles = elapsed;
+    if (elapsed > t->wcet_cycles) {
+        t->wcet_cycles = elapsed;
+    }
+}
 
-    *gx = 38.0f * 2.0f * M_PI * 0.5f * cosf(2.0f * M_PI * 0.5f * t);
-    *gy = -15.0f * 2.0f * M_PI * 0.25f * sinf(2.0f * M_PI * 0.25f * t);
+static inline uint32_t Cycles_To_Us(uint32_t cycles) {
+    return cycles / (CPU_CLK_HZ / 1000000UL);
+}
+
+// Simulates X/Y joystick-like inputs (square/step setpoint + slight noise)
+// Replace with ADC1 reads when wiring a physical joystick to PA0/PA1.
+static void Read_Simulated_XY_Channels(float *x_setpoint, float *y_feedback_raw) {
+    static uint32_t step_counter = 0;
+    float t = step_counter * DT_T1_SEC;
+    step_counter++;
+
+    // Step setpoint between 25.0 and 75.0 every 4 seconds
+    int phase = ((int)(t / 4.0f)) % 2;
+    float base_sp = (phase == 0) ? 75.0f : 25.0f;
+
+    // Small deterministic ripple to exercise the digital low-pass filter
+    float ripple = 2.0f * sinf(2.0f * (float)M_PI * 3.0f * t);
+    *x_setpoint = base_sp + ripple;
+
+    // Secondary channel / disturbance signal
+    *y_feedback_raw = 0.5f * sinf(2.0f * (float)M_PI * 1.0f * t);
+}
+
+static void PID_Init(PID_Controller_t *pid, float kp, float ki, float kd,
+                     float dt, float out_min, float out_max) {
+    pid->kp = kp;
+    pid->ki = ki;
+    pid->kd = kd;
+    pid->dt = dt;
+    pid->integral = 0.0f;
+    pid->prev_error = 0.0f;
+    pid->out_min = out_min;
+    pid->out_max = out_max;
+}
+
+static float PID_Compute(PID_Controller_t *pid, float setpoint, float measurement) {
+    float error = setpoint - measurement;
+
+    float p_term = pid->kp * error;
+
+    // Integral with output clamping anti-windup
+    pid->integral += error * pid->dt;
+    float max_i = (pid->ki != 0.0f) ? (pid->out_max / pid->ki) : pid->out_max;
+    float min_i = (pid->ki != 0.0f) ? (pid->out_min / pid->ki) : pid->out_min;
+    if (pid->integral > max_i) pid->integral = max_i;
+    if (pid->integral < min_i) pid->integral = min_i;
+    float i_term = pid->ki * pid->integral;
+
+    float derivative = (error - pid->prev_error) / pid->dt;
+    float d_term = pid->kd * derivative;
+    pid->prev_error = error;
+
+    float out = p_term + i_term + d_term;
+    if (out > pid->out_max) out = pid->out_max;
+    if (out < pid->out_min) out = pid->out_min;
+    return out;
 }
 
 /* ============================================================================
  * 4. FREERTOS TASKS
  * ============================================================================ */
 
-/* TASK 1: IMU Acquisition & Complementary Filter (10 ms period, Priority 3) */
-void vTask1_IMUAcquisition(void *pvParameters) {
+/* TASK 1: Input Acquisition & Digital Low-Pass Filter (10 ms via TIM3 ISR, Prio 3) */
+void vTask1_InputAndFilter(void *pvParameters) {
     (void)pvParameters;
-    float ax, ay, az, gx, gy;
-    float pitch = 0.0f, roll = 0.0f;
-    IMU_AngleMsg_t msg;
+    float raw_x = 0.0f, raw_y = 0.0f;
+    float filt_x = 50.0f, filt_y = 0.0f;
+    ControlInput_Msg_t msg;
 
     for (;;) {
-        // Sleep until TIM3 ISR fires notification every 10.0 ms
+        // Block until TIM3 ISR notifies every 10 ms
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        LA_T1_HIGH(); // PC0 HIGH
+        GPIO_T1_HIGH();
+        uint32_t t_start = Timing_OnEntry(&g_T1_Timing);
 
-        Read_Synthetic_IMU(&ax, &ay, &az, &gx, &gy);
+        Read_Simulated_XY_Channels(&raw_x, &raw_y);
 
-        float accel_pitch = atan2f(ax, sqrtf(ay * ay + az * az)) * (180.0f / M_PI);
-        float accel_roll  = atan2f(ay, sqrtf(ax * ax + az * az)) * (180.0f / M_PI);
+        // First-order exponential low-pass filter
+        filt_x = LPF_ALPHA * filt_x + (1.0f - LPF_ALPHA) * raw_x;
+        filt_y = LPF_ALPHA * filt_y + (1.0f - LPF_ALPHA) * raw_y;
 
-        pitch = COMP_ALPHA * (pitch + gx * DT_SEC) + (1.0f - COMP_ALPHA) * accel_pitch;
-        roll  = COMP_ALPHA * (roll  + gy * DT_SEC) + (1.0f - COMP_ALPHA) * accel_roll;
+        msg.setpoint = filt_x;
+        msg.feedback = filt_y;
+        msg.tick_ms  = xTaskGetTickCount();
 
-        msg.pitch = pitch;
-        msg.roll  = roll;
-        msg.timestamp_ms = xTaskGetTickCount();
-        xQueueSend(xAngleQueue, &msg, 0);
+        // Overwrite oldest if queue is full so Task 2 always gets fresh data
+        if (xQueueSend(xControlQueue, &msg, 0) != pdPASS) {
+            ControlInput_Msg_t discard;
+            xQueueReceive(xControlQueue, &discard, 0);
+            xQueueSend(xControlQueue, &msg, 0);
+        }
 
         g_Task1Alive = 1;
 
-        LA_T1_LOW();  // PC0 LOW
+        Timing_OnExit(&g_T1_Timing, t_start);
+        GPIO_T1_LOW();
     }
 }
 
-/* TASK 2: Data Processing & Threshold Detection (50 ms period, Priority 2) */
-void vTask2_DataProcessing(void *pvParameters) {
+/* TASK 2: Closed-Loop PID Controller & Virtual Plant (50 ms, Priority 2) */
+void vTask2_PIDController(void *pvParameters) {
     (void)pvParameters;
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xPeriod = pdMS_TO_TICKS(50);
 
-    IMU_AngleMsg_t rx_msg;
-    float pitch_buf[MOVING_AVG_WINDOW] = {0};
-    float roll_buf[MOVING_AVG_WINDOW]  = {0};
-    uint8_t buf_idx = 0;
+    PID_Controller_t pid;
+    PID_Init(&pid, 1.8f, 2.5f, 0.15f, DT_T2_SEC, 0.0f, 100.0f);
+
+    ControlInput_Msg_t rx_msg;
+    float current_sp = 50.0f;
+    float plant_output = 50.0f; // Simulated motor/plant state (0..100%)
 
     for (;;) {
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
 
-        LA_T2_HIGH(); // PC1 HIGH
+        GPIO_T2_HIGH();
+        uint32_t t_start = Timing_OnEntry(&g_T2_Timing);
 
-        while (xQueueReceive(xAngleQueue, &rx_msg, 0) == pdPASS) {
-            pitch_buf[buf_idx] = rx_msg.pitch;
-            roll_buf[buf_idx]  = rx_msg.roll;
-            buf_idx = (buf_idx + 1) % MOVING_AVG_WINDOW;
+        // Drain queue to get the latest filtered setpoint
+        while (xQueueReceive(xControlQueue, &rx_msg, 0) == pdPASS) {
+            current_sp = rx_msg.setpoint;
         }
 
-        float sum_p = 0.0f, sum_r = 0.0f;
-        for (int i = 0; i < MOVING_AVG_WINDOW; i++) {
-            sum_p += pitch_buf[i];
-            sum_r += roll_buf[i];
-        }
-        float avg_pitch = sum_p / (float)MOVING_AVG_WINDOW;
-        float avg_roll  = sum_r / (float)MOVING_AVG_WINDOW;
+        float error = current_sp - plant_output;
+        float control_effort = PID_Compute(&pid, current_sp, plant_output);
 
-        uint8_t alarm = (fabsf(avg_pitch) > TILT_THRESHOLD_DEG ||
-                         fabsf(avg_roll)  > TILT_THRESHOLD_DEG) ? 1 : 0;
+        // First-order plant dynamics: dy/dt = (-y + k * u) / tau
+        float tau = 0.35f;
+        float k_gain = 1.0f;
+        plant_output += ((-plant_output + k_gain * control_effort) / tau) * DT_T2_SEC;
+        if (plant_output < 0.0f) plant_output = 0.0f;
+        if (plant_output > 100.0f) plant_output = 100.0f;
 
-        // Nucleo Green LED (PA5) lights up on Tilt Alarm (>30 deg)
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, alarm ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        // Visual indicator on onboard LD2 (PA5) when tracking error exceeds 15 units
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, (fabsf(error) > 15.0f) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            g_SystemState.filtered_pitch = avg_pitch;
-            g_SystemState.filtered_roll  = avg_roll;
-            g_SystemState.tilt_alarm     = alarm;
-            g_SystemState.sample_count++;
+            g_TelemetryState.setpoint     = current_sp;
+            g_TelemetryState.output       = plant_output;
+            g_TelemetryState.error        = error;
+            g_TelemetryState.seq++;
+            g_TelemetryState.t1_period_us = Cycles_To_Us(g_T1_Timing.last_period_cycles);
+            g_TelemetryState.t2_period_us = Cycles_To_Us(g_T2_Timing.last_period_cycles);
+            g_TelemetryState.t1_wcet_us   = Cycles_To_Us(g_T1_Timing.wcet_cycles);
+            g_TelemetryState.t2_wcet_us   = Cycles_To_Us(g_T2_Timing.wcet_cycles);
             xSemaphoreGive(xStateMutex);
         }
 
         g_Task2Alive = 1;
 
-        LA_T2_LOW();  // PC1 LOW
+        Timing_OnExit(&g_T2_Timing, t_start);
+        GPIO_T2_LOW();
     }
 }
 
-/* TASK 3: JSON Telemetry TX & Watchdog Supervision (500 ms period, Priority 1) */
-void vTask3_TelemetryTX(void *pvParameters) {
+/* TASK 3: UART JSON Telemetry & Watchdog Supervision (500 ms, Priority 1) */
+void vTask3_TelemetryUART(void *pvParameters) {
     (void)pvParameters;
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xPeriod = pdMS_TO_TICKS(500);
 
-    SharedSystemState_t local_copy = {0};
-    char json_buf[128];
+    TelemetryState_t snap = {0};
+    char uart_buf[256];
 
     for (;;) {
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
 
-        LA_T3_HIGH(); // PC2 HIGH
+        GPIO_T3_HIGH();
+        uint32_t t_start = Timing_OnEntry(&g_T3_Timing);
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            local_copy = g_SystemState;
+            snap = g_TelemetryState;
+            snap.t3_period_us = Cycles_To_Us(g_T3_Timing.last_period_cycles);
+            snap.t3_wcet_us   = Cycles_To_Us(g_T3_Timing.wcet_cycles);
             xSemaphoreGive(xStateMutex);
         }
 
-        int len = snprintf(json_buf, sizeof(json_buf),
-            "{\"ts\":%lu,\"pitch\":%.2f,\"roll\":%.2f,\"alarm\":%u,\"seq\":%lu}\r\n",
+        int len = snprintf(uart_buf, sizeof(uart_buf),
+            "{\"ts\":%lu,\"sp\":%.2f,\"out\":%.2f,\"err\":%.2f,"
+            "\"period_us\":[%lu,%lu,%lu],\"wcet_us\":[%lu,%lu,%lu],\"seq\":%lu}\r\n",
             (unsigned long)xTaskGetTickCount(),
-            local_copy.filtered_pitch,
-            local_copy.filtered_roll,
-            local_copy.tilt_alarm,
-            (unsigned long)local_copy.sample_count);
+            snap.setpoint,
+            snap.output,
+            snap.error,
+            (unsigned long)snap.t1_period_us,
+            (unsigned long)snap.t2_period_us,
+            (unsigned long)snap.t3_period_us,
+            (unsigned long)snap.t1_wcet_us,
+            (unsigned long)snap.t2_wcet_us,
+            (unsigned long)snap.t3_wcet_us,
+            (unsigned long)snap.seq);
 
-        HAL_UART_Transmit(&huart2, (uint8_t *)json_buf, len, 25);
+        HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, (uint16_t)len, 30);
 
+        // Kick IWDG only when higher-priority tasks have executed since last check
         if (g_Task1Alive && g_Task2Alive) {
             g_Task1Alive = 0;
             g_Task2Alive = 0;
             HAL_IWDG_Refresh(&hiwdg);
         }
 
-        LA_T3_LOW();  // PC2 LOW
+        Timing_OnExit(&g_T3_Timing, t_start);
+        GPIO_T3_LOW();
     }
 }
 
@@ -214,23 +331,21 @@ void SysTick_Handler(void) {
 }
 
 /**
- * @brief TIM3 Hardware ISR firing at 1000 Hz (1.0 ms).
- *        1. Drives FreeRTOS 1 ms kernel tick.
- *        2. Every 10 ticks (10.0 ms), fires direct Task Notification to wake Task 1.
+ * @brief TIM3 ISR at 1000 Hz (1.0 ms):
+ *        - Advances FreeRTOS tick
+ *        - Every 10 ticks (10.0 ms), wakes Task 1 via direct task notification
  */
 void TIM3_IRQHandler(void) {
     if (TIM3->SR & TIM_SR_UIF) {
-        TIM3->SR &= ~TIM_SR_UIF; // Clear update interrupt flag
+        TIM3->SR &= ~TIM_SR_UIF;
 
         if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
-            // 1. Advance FreeRTOS Tick
             xPortSysTickHandler();
 
-            // 2. Wake Task 1 every 10 ms (100 Hz) via ISR Notification
-            static uint8_t decimator = 0;
-            decimator++;
-            if (decimator >= 10) {
-                decimator = 0;
+            static uint8_t prescale_10ms = 0;
+            prescale_10ms++;
+            if (prescale_10ms >= 10) {
+                prescale_10ms = 0;
                 BaseType_t xHigherPriorityTaskWoken = pdFALSE;
                 if (xTask1Handle != NULL) {
                     vTaskNotifyGiveFromISR(xTask1Handle, &xHigherPriorityTaskWoken);
@@ -242,13 +357,12 @@ void TIM3_IRQHandler(void) {
 }
 
 /* ============================================================================
- * 6. HARDWARE PERIPHERAL INITIALIZATION (64 MHz Clock, GPIO, UART2, TIM3, IWDG)
+ * 6. HARDWARE INITIALIZATION (64 MHz Clock, GPIO, USART2, TIM3, IWDG)
  * ============================================================================ */
 static void SystemClock_Config(void) {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    // HSI (8 MHz) / 2 * 16 = 64 MHz SystemCoreClock (works on every Nucleo-F103RB)
     RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI | RCC_OSCILLATORTYPE_LSI;
     RCC_OscInitStruct.HSIState = RCC_HSI_ON;
     RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -261,9 +375,9 @@ static void SystemClock_Config(void) {
     RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
                                   RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
     RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;   // HCLK = 64 MHz
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;    // APB1 = 32 MHz (TIM3 clk = 64 MHz)
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;    // APB2 = 64 MHz
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;   // 64 MHz
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;    // 32 MHz (TIM3 clock = 64 MHz)
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;    // 64 MHz
     HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
 }
 
@@ -273,14 +387,14 @@ static void GPIO_Init(void) {
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-    // PA5: Onboard User Green LED (LD2)
+    // PA5: Onboard User LED (LD2)
     GPIO_InitStruct.Pin = GPIO_PIN_5;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    // PC0, PC1, PC2: Logic Analyser Task Profiling Pins
+    // PC0, PC1, PC2: Task Entry/Exit GPIO Profiling Pins
     GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -293,13 +407,12 @@ static void USART2_Init(void) {
     __HAL_RCC_GPIOA_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-    // PA2 -> USART2_TX, PA3 -> USART2_RX
-    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    GPIO_InitStruct.Pin = GPIO_PIN_2; // USART2_TX
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    GPIO_InitStruct.Pin = GPIO_PIN_3;
+    GPIO_InitStruct.Pin = GPIO_PIN_3; // USART2_RX
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -316,23 +429,22 @@ static void USART2_Init(void) {
 }
 
 static void TIM3_BareMetal_Init(void) {
-    // Enable TIM3 clock on APB1 (Timer clock = 64 MHz)
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
-    // 64 MHz / 64 = 1 MHz (1 us tick); 1000 ticks = 1.0 ms (1000 Hz)
+    // 64 MHz / 64 = 1 MHz tick; ARR = 1000 - 1 => 1000 Hz (1.0 ms interrupt)
     TIM3->PSC = 64 - 1;
     TIM3->ARR = 1000 - 1;
-    TIM3->DIER |= TIM_DIER_UIE; // Enable update interrupt
+    TIM3->DIER |= TIM_DIER_UIE;
 
-    // Priority MUST be >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5)
+    // Priority >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5)
     NVIC_SetPriority(TIM3_IRQn, 6);
     NVIC_EnableIRQ(TIM3_IRQn);
 
-    TIM3->CR1 |= TIM_CR1_CEN;   // Start TIM3
+    TIM3->CR1 |= TIM_CR1_CEN;
 }
 
 static void IWDG_Init(void) {
-    // LSI is ~40 kHz. Prescaler 32 -> 1250 Hz -> Reload 1500 = ~1.2 sec watchdog timeout
+    // ~1.2 s timeout at ~40 kHz LSI
     hiwdg.Instance = IWDG;
     hiwdg.Init.Prescaler = IWDG_PRESCALER_32;
     hiwdg.Init.Reload = 1500;
@@ -345,23 +457,21 @@ static void IWDG_Init(void) {
 int main(void) {
     HAL_Init();
     SystemClock_Config();
-
-    // Ensure 4 priority bits (0 subpriority bits) as required by FreeRTOS on Cortex-M3
     HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
 
     GPIO_Init();
     USART2_Init();
+    DWT_CycleCounter_Init();
     IWDG_Init();
 
-    xAngleQueue = xQueueCreate(16, sizeof(IMU_AngleMsg_t));
-    xStateMutex = xSemaphoreCreateMutex();
+    xControlQueue = xQueueCreate(16, sizeof(ControlInput_Msg_t));
+    xStateMutex   = xSemaphoreCreateMutex();
 
-    xTaskCreate(vTask1_IMUAcquisition, "IMU_Acq",  256, NULL, 3, &xTask1Handle);
-    xTaskCreate(vTask2_DataProcessing, "Data_Proc", 256, NULL, 2, &xTask2Handle);
-    xTaskCreate(vTask3_TelemetryTX,    "Telem_TX",  512, NULL, 1, &xTask3Handle);
+    xTaskCreate(vTask1_InputAndFilter, "Task1_LPF",  256, NULL, 3, &xTask1Handle);
+    xTaskCreate(vTask2_PIDController,  "Task2_PID",  384, NULL, 2, &xTask2Handle);
+    xTaskCreate(vTask3_TelemetryUART,  "Task3_UART", 512, NULL, 1, &xTask3Handle);
 
     TIM3_BareMetal_Init();
-
     vTaskStartScheduler();
 
     while (1) {}
